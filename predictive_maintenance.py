@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-FleetSense — Predictive Maintenance Engine (Python, standard library only)
-============================================================================
 
 What this is
 -------------
@@ -16,15 +14,8 @@ A predictive-maintenance system where:
      prediction shifts from "what machines like this usually do" toward
      "what THIS machine is actually doing".
 
-Why not React / C++
----------------------
-This is a data + reasoning problem, not a rendering problem, so plain Python
-(no dependencies — just the standard library) is the natural fit: fast to
-read, fast to run anywhere, and trivial to later swap in scikit-learn or a
-real database without changing the interface. C++ would work but buys you
-nothing here except more boilerplate for the same statistics.
 
-How the "learns from other machines" part actually works
+How the ML part actually works
 -----------------------------------------------------------
 - Every machine TYPE (e.g. "Centrifugal Pump") has a baseline degradation
   curve: health_score(hours) = 100 * exp(-k/1000 * hours).
@@ -40,8 +31,6 @@ How the "learns from other machines" part actually works
   (a reasonable, humble default). With more of its own readings, the
   prediction becomes machine-specific and reported confidence rises.
 
-Run this file directly for a walkthrough demo, or import the classes to
-build a CLI / API / UI on top of `Fleet`.
 """
 
 from __future__ import annotations
@@ -160,15 +149,13 @@ class PredictionReport:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# The fleet — this is where cross-machine learning happens
-# ---------------------------------------------------------------------------
+#cross-machine learning happens
+
 
 class Fleet:
     def __init__(self):
         self.machines: Dict[str, Machine] = {}
 
-    # ---- owner-facing actions -------------------------------------------------
 
     def add_machine(self, machine_id: str, owner: str, name: str, machine_type: str, site: str) -> Machine:
         if machine_type not in TYPE_BASELINES:
@@ -210,8 +197,14 @@ class Fleet:
 
     def predict(self, machine_id: str) -> PredictionReport:
         machine = self._require(machine_id)
+        return self._predict_core(machine, machine.readings)
+
+    def _predict_core(self, machine: "Machine", readings: List[SensorReading]) -> PredictionReport:
+        """ This lets backtest_accuracy()
+        replay history — 'what would we have predicted using only the first
+        N readings?' — without mutating the real machine record."""
         cohort = self.cohort_for(machine)
-        hours = machine.current_hours()
+        hours = readings[-1].hours_since_install if readings else 0.0
         base = TYPE_BASELINES[machine.machine_type]
         cohort_k = base["k"]
 
@@ -219,7 +212,7 @@ class Fleet:
         recommended: List[str] = []
         risk_multiplier = 1.0
 
-        latest = machine.latest()
+        latest = readings[-1] if readings else None
         if latest is not None:
             near_readings = self._cohort_readings_near_age(cohort, hours)
             for sensor, label, unit in [("vibration", "Vibration", "mm/s"),
@@ -259,7 +252,7 @@ class Fleet:
             if predicted_days > 365:
                 predicted_days = None
 
-        own_n = len(machine.readings)
+        own_n = len(readings)
         cohort_n = len(cohort)
         confidence_score = min(1.0, cohort_n / 8) * 0.5 + min(1.0, own_n / 5) * 0.5
         confidence = "High" if confidence_score >= 0.75 else "Medium" if confidence_score >= 0.4 else "Low"
@@ -295,6 +288,60 @@ class Fleet:
             horizon = f"{p.predicted_days_to_failure:.0f}d" if p.predicted_days_to_failure else "—"
             lines.append(f"  {m.machine_id:<10} {m.machine_type:<18} score={p.health_score:5.1f}  horizon={horizon:>6}  conf={p.confidence}")
         return "\n".join(lines)
+
+    def health_history(self, machine_id: str) -> List[dict]:
+        """Replay a machine's own readings one at a time so a UI can chart how
+        its health score evolved as each new reading came in."""
+        machine = self._require(machine_id)
+        out = []
+        for i in range(1, len(machine.readings) + 1):
+            subset = machine.readings[:i]
+            report = self._predict_core(machine, subset)
+            out.append({"hours": subset[-1].hours_since_install, "health_score": report.health_score})
+        return out
+
+    # ---- accuracy: does this model actually predict well? -----------------
+
+    def record_actual_failure(self, machine_id: str, actual_hours: float) -> None:
+        """Owner reports a machine actually failed at a given runtime-hour
+        reading. This is what turns 'a model that sounds plausible' into
+        'a model with a measured track record' — see backtest_accuracy()."""
+        m = self._require(machine_id)
+        m.failed = True
+        m.failure_hours = actual_hours
+
+    def backtest_accuracy(self, machine_type: Optional[str] = None) -> List[dict]:
+        """For every machine that has actually failed (seeded history, or an
+        owner's machine after record_actual_failure), replay its readings one
+        at a time and ask: 'using only what we knew back then, how many hours
+        off was the prediction from the real failure point?'
+
+        Returns one row per (machine, reading-index) so you can plot how the
+        error shrinks as more of a machine's own readings come in — the
+        concrete, checkable version of the cohort-learning claim.
+        """
+        rows = []
+        failed_machines = [m for m in self.machines.values()
+                            if m.failed and m.failure_hours and (machine_type is None or m.machine_type == machine_type)]
+        for m in failed_machines:
+            for i in range(1, len(m.readings) + 1):
+                subset = m.readings[:i]
+                report = self._predict_core(m, subset)
+                if report.predicted_days_to_failure is None:
+                    continue
+                predicted_failure_hour = subset[-1].hours_since_install + report.predicted_days_to_failure * 16
+                error_hours = predicted_failure_hour - m.failure_hours
+                rows.append({
+                    "machine_id": m.machine_id,
+                    "machine_type": m.machine_type,
+                    "readings_used": i,
+                    "hours_at_prediction": subset[-1].hours_since_install,
+                    "predicted_failure_hour": predicted_failure_hour,
+                    "actual_failure_hour": m.failure_hours,
+                    "error_hours": error_hours,
+                    "pct_error": abs(error_hours) / m.failure_hours * 100,
+                })
+        return rows
 
     # ---- persistence so owners can keep adding data across sessions ------
 
